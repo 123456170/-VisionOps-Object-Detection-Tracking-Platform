@@ -232,18 +232,44 @@ class MotionContourDetector(Detector):
 
 
 class HaarFaceBodyDetector(Detector):
-    """Classical Viola-Jones detector for faces / bodies — ships with OpenCV, no download."""
+    """Classical Viola-Jones detector for faces / bodies — ships with OpenCV, no download.
+    Loading is defensive: some OpenCV builds/deployments (e.g. certain
+    headless installs or restricted filesystems on hosted platforms) don't
+    expose the bundled cascade XML files at `cv2.data.haarcascades`. In that
+    case this detector marks itself unavailable instead of raising and
+    crashing the whole app at import time — the registry builder below skips
+    registering it, so the sidebar simply won't offer it as an option."""
     name = "Haar Cascade — Face/Body (built-in)"
     supports_segmentation = False
     supports_classification = True
 
     def __init__(self):
-        base = cv2.data.haarcascades
-        self.face_cascade = cv2.CascadeClassifier(base + "haarcascade_frontalface_default.xml")
-        self.body_cascade = cv2.CascadeClassifier(base + "haarcascade_fullbody.xml")
+        self.available = False
+        self.face_cascade = None
+        self.body_cascade = None
+        try:
+            base = cv2.data.haarcascades
+            face_path = os.path.join(base, "haarcascade_frontalface_default.xml")
+            body_path = os.path.join(base, "haarcascade_fullbody.xml")
+
+            face_cc = cv2.CascadeClassifier(face_path)
+            body_cc = cv2.CascadeClassifier(body_path)
+
+            # CascadeClassifier doesn't always raise on a bad path — it can
+            # silently construct an empty classifier. Check explicitly.
+            if face_cc.empty() or body_cc.empty():
+                raise RuntimeError("Haar cascade XML files not found in this OpenCV build")
+
+            self.face_cascade = face_cc
+            self.body_cascade = body_cc
+            self.available = True
+        except Exception:
+            self.available = False
 
     def detect(self, frame, conf_threshold, enabled_classes, max_detections,
                segmentation=False) -> List[Detection]:
+        if not self.available:
+            return []
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         gray = cv2.equalizeHist(gray)
         detections: List[Detection] = []
@@ -316,12 +342,46 @@ DETECTOR_REGISTRY: Dict[str, Detector] = {}
 
 
 def _build_detector_registry():
+    """
+    Build the detector registry defensively. Every backend is tried
+    independently — if one fails to initialize (missing model files,
+    incompatible OpenCV build, missing optional dependency, etc.) it is
+    skipped with a warning instead of crashing the whole app. The
+    `Motion + Contour` backend has no external file/model dependency and is
+    the guaranteed fallback, so at least one detector is always available.
+    """
     if DETECTOR_REGISTRY:
         return
-    DETECTOR_REGISTRY["Motion + Contour (built-in)"] = MotionContourDetector()
-    DETECTOR_REGISTRY["Haar Cascade — Face/Body (built-in)"] = HaarFaceBodyDetector()
+
+    try:
+        DETECTOR_REGISTRY["Motion + Contour (built-in)"] = MotionContourDetector()
+    except Exception as e:
+        st.session_state.setdefault("_registry_warnings", []).append(
+            f"Motion + Contour detector failed to load: {e}")
+
+    try:
+        haar = HaarFaceBodyDetector()
+        if haar.available:
+            DETECTOR_REGISTRY["Haar Cascade — Face/Body (built-in)"] = haar
+        else:
+            st.session_state.setdefault("_registry_warnings", []).append(
+                "Haar Cascade detector unavailable in this environment "
+                "(cascade XML files not found in this OpenCV build) — skipped.")
+    except Exception as e:
+        st.session_state.setdefault("_registry_warnings", []).append(
+            f"Haar Cascade detector failed to load: {e}")
+
     if YOLO_AVAILABLE:
-        DETECTOR_REGISTRY["YOLOv8 (ultralytics — deep learning)"] = YOLODetector()
+        try:
+            DETECTOR_REGISTRY["YOLOv8 (ultralytics — deep learning)"] = YOLODetector()
+        except Exception as e:
+            st.session_state.setdefault("_registry_warnings", []).append(
+                f"YOLOv8 detector failed to load: {e}")
+
+    if not DETECTOR_REGISTRY:
+        # Should never happen (Motion+Contour has zero external deps), but
+        # guarantees the app never ends up with an empty registry.
+        DETECTOR_REGISTRY["Motion + Contour (built-in)"] = MotionContourDetector()
 
 
 # ===========================================================================
